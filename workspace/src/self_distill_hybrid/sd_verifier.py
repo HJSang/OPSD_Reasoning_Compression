@@ -282,8 +282,13 @@ def _tokenize_sequence(
 ) -> Optional[dict]:
     """Tokenize a single (prompt, response) pair into padded tensors.
 
-    Returns dict with input_ids, attention_mask, position_ids, loss_mask,
-    or None if the sequence is too short.
+    Returns dict with input_ids, attention_mask, position_ids, loss_mask, or
+    None if the sequence is too short OR would exceed max_length. Refusing
+    over-length sequences (rather than truncating) is load-bearing: OPSD's
+    JSD/reverse-KL loss aligns teacher and student response logits by
+    position, so per-sample response-token counts must match between the
+    two prompts. Truncating just the teacher (because its prompt is longer)
+    would silently misalign all subsequent samples in the flattened batch.
     """
     messages = json.loads(prompt_str)
     prompt_ids = tokenizer.apply_chat_template(
@@ -297,8 +302,7 @@ def _tokenize_sequence(
     loss_mask = [0] * len(prompt_ids) + [1] * len(response_ids)
 
     if len(full_ids) > max_length:
-        full_ids = full_ids[:max_length]
-        loss_mask = loss_mask[:max_length]
+        return None
 
     seq_len = len(full_ids)
     if seq_len < 2:
@@ -311,6 +315,33 @@ def _tokenize_sequence(
         "position_ids": torch.tensor(list(range(seq_len)) + [0] * pad_len, dtype=torch.long),
         "loss_mask": torch.tensor(loss_mask + [0] * pad_len, dtype=torch.float32),
     }
+
+
+def _log_first_opsd_pair(
+    t_prompt: str, s_prompt: str, response_text: str, max_length: int
+) -> None:
+    """Log the first (teacher, student, response) triple of each batch for sanity-checking.
+
+    Decodes the JSON-encoded chat prompts so they're readable in logs, and
+    truncates the response to a preview so noisy logs stay bounded.
+    """
+    try:
+        t_msgs = json.loads(t_prompt)
+        s_msgs = json.loads(s_prompt)
+    except (json.JSONDecodeError, TypeError):
+        t_msgs, s_msgs = t_prompt, s_prompt
+
+    response_preview = response_text[:500] + ("…" if len(response_text) > 500 else "")
+    # Emitted at WARNING so the preview survives the cluster's default
+    # log level (Hydra raises __main__ to INFO but not the root logger,
+    # so logger.info(...) here would be filtered).
+    logger.warning(
+        "OPSD batch[0] sample preview (max_length=%d):\n"
+        "  teacher_prompt (sd_prompt) messages: %s\n"
+        "  student_prompt (sft_prompt) messages: %s\n"
+        "  response (%d chars): %s",
+        max_length, t_msgs, s_msgs, len(response_text), response_preview,
+    )
 
 
 def build_opsd_batch(
@@ -352,8 +383,12 @@ def build_opsd_batch(
     teacher_seqs = []
     student_seqs = []
     skipped = 0
+    for idx, (t_prompt, s_prompt, response_text) in enumerate(
+        zip(teacher_prompts, student_prompts, responses)
+    ):
+        if idx == 0:
+            _log_first_opsd_pair(t_prompt, s_prompt, response_text, max_length)
 
-    for t_prompt, s_prompt, response_text in zip(teacher_prompts, student_prompts, responses):
         t_seq = _tokenize_sequence(t_prompt, response_text, tokenizer, max_length, pad_token_id)
         s_seq = _tokenize_sequence(s_prompt, response_text, tokenizer, max_length, pad_token_id)
 
@@ -365,7 +400,13 @@ def build_opsd_batch(
         student_seqs.append(s_seq)
 
     if skipped:
-        logger.warning("Skipped %d samples during OPSD batch construction (too short)", skipped)
+        total = len(teacher_prompts)
+        logger.warning(
+            "OPSD batch construction skipped %d/%d samples (too short or longer than max_length=%d). "
+            "Bump opsd.sft_max_length if this fraction is large — silently dropped samples are "
+            "the only way to keep teacher/student response logits aligned per-sample.",
+            skipped, total, max_length,
+        )
 
     if not teacher_seqs:
         return None

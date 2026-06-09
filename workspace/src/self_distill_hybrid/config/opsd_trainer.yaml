@@ -33,11 +33,11 @@ defaults:
   # Model config (path, gradient checkpointing, etc.)
   - model@actor_rollout_ref.model: hf_model
 
-  # Reward model config (included for schema compatibility, not used)
-  - reward_model@reward_model: dp_reward_loop
+  # Legacy reward impl (for backward compat with old reward_model schema)
+  - legacy_reward_impl
 
-  # Reward manager config (for schema compatibility)
-  - reward_manager@reward_manager
+  # Reward config (new verl 0.7.x layout; load_reward_manager reads config.reward.*)
+  - reward@reward: reward
 
   # Rollout correction config (for schema compatibility)
   - algorithm@algorithm.rollout_correction: rollout_correction
@@ -46,9 +46,6 @@ defaults:
 
 # ---------- Data overrides ----------
 data:
-  # SD val split for periodic val loss computation
-  sd_val_files: null
-
   # Pin Qwen3 thinking mode explicitly. The Qwen3 tokenizer's default is
   # enable_thinking=True, but pinning here guards against upstream default
   # drift in future tokenizer releases.
@@ -137,12 +134,9 @@ opsd:
   # Number of sample responses to log per step
   log_sample_count: 5
 
-  # Validation loss frequency: compute val loss every N training steps.
+  # Generation-based validation frequency (uses data.val_files + reward fn).
   # Set to 0 or -1 to disable.
   test_freq: 10
-
-  # Max number of val samples to use (-1 = use all).
-  val_max_samples: -1
 
   # Write detailed JSON log files every N steps
   log_freq: 5
@@ -163,11 +157,9 @@ reward_model:
   use_dynamic_bsz: false
   forward_max_token_len_per_gpu: 16384
 
-# ---------- Custom reward function ----------
-custom_reward_function:
-  path: null
-  name: compute_score
-  reward_kwargs: {}
+# Custom reward function lives under `reward.custom_reward_function`
+# (provided by the inherited `reward@reward: reward` default). Override at the
+# CLI as: reward.custom_reward_function.path=/path/to/scorer.py
 
 # ---------- Trainer config ----------
 trainer:

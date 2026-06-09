@@ -1,19 +1,18 @@
 """
-Preprocess DAPO-Math-17k-dedup into train/val splits and
-validation datasets: aime24, aime25, MATH-500
+Preprocess DAPO-Math-17k-dedup as the training set and prepare the
+held-out validation datasets: AIME 2024, AIME 2025, MATH-500.
 
 Output Files:
     Training Data:
-        - train.parquet: DAPO-Math-17k-dedup training split
-        - train_example.json: Example of training data format
+        - train.parquet: full DAPO-Math-17k-dedup, RL format
+        - train_example.json: example of training data format
 
     Validation Data:
-        - val_dapo.parquet: DAPO-Math-17k-dedup validation split
         - val_aime24.parquet: AIME 2024 validation set
         - val_aime25.parquet: AIME 2025 validation set
         - val_math500.parquet: MATH-500 validation set
-        - val_combined.parquet: All validation sets combined
-        - val_example.json: Example of validation data format
+        - val_combined.parquet: all three validation sets concatenated
+        - val_example.json: example of validation data format
 
 Usage:
     python process_eval_data.py --data_dir /path/to/data --output_dir /path/to/output
@@ -38,16 +37,18 @@ INSTRUCTION_PREFIX = _PROMPTS[_PROMPT_TEMPLATE_KEY]["prefix"]
 INSTRUCTION_SUFFIX = _PROMPTS[_PROMPT_TEMPLATE_KEY].get("suffix", "")
 
 
-def process_dapo(data_path, val_fraction=0.05, seed=42):
-    """Process DAPO-Math-17k-dedup with train/val split.
+def process_dapo(data_path):
+    """Process DAPO-Math-17k-dedup as a single training split.
+
+    The training pipeline validates on AIME24/AIME25/MATH-500 only, so the
+    previous train/val split was producing a val_dapo.parquet that no
+    downstream code consumed. Keep all examples in training instead.
 
     Args:
         data_path: Path to the DAPO parquet file.
-        val_fraction: Fraction of data to use for validation (default 5%).
-        seed: Random seed for reproducible splitting.
 
     Returns:
-        (train_dataset, val_dataset) tuple.
+        Training dataset.
     """
     print(f"Loading DAPO-Math-17k-dedup data from {data_path}...", flush=True)
     df = pd.read_parquet(data_path)
@@ -78,14 +79,8 @@ def process_dapo(data_path, val_fraction=0.05, seed=42):
     dataset = dataset.map(function=process_fn, with_indices=True)
     dataset = dataset.select_columns(['data_source', 'prompt', 'ability', 'reward_model', 'extra_info'])
 
-    # Split into train/val
-    split = dataset.train_test_split(test_size=val_fraction, seed=seed)
-    train_dataset = split['train']
-    val_dataset = split['test']
-
-    print(f"Processed {len(dataset)} examples from DAPO-Math-17k-dedup")
-    print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-    return train_dataset, val_dataset
+    print(f"Processed {len(dataset)} examples from DAPO-Math-17k-dedup (training only)")
+    return dataset
 
 
 def extract_boxed_answer(text):
@@ -234,12 +229,13 @@ if __name__ == "__main__":
     output_dir = os.path.expanduser(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Process DAPO training data with train/val split
+    # Process DAPO as the training set (no held-out val — validation runs
+    # on AIME24 / AIME25 / MATH-500 only).
     print("\n" + "="*80)
-    print("Processing DAPO-Math-17k-dedup (train/val split)")
+    print("Processing DAPO-Math-17k-dedup (training set)")
     print("="*80)
     train_path = os.path.join(data_dir, "DAPO-Math-17k-dedup", "distinct-prompts-with-rewards.parquet")
-    train_dataset, dapo_val_dataset = process_dapo(train_path)
+    train_dataset = process_dapo(train_path)
 
     train_output_path = os.path.join(output_dir, "train.parquet")
     train_dataset.to_parquet(train_output_path)
@@ -248,10 +244,6 @@ if __name__ == "__main__":
     train_example = train_dataset[0]
     with open(os.path.join(output_dir, "train_example.json"), 'w') as f:
         json.dump(train_example, f, indent=2)
-
-    dapo_val_output_path = os.path.join(output_dir, "val_dapo.parquet")
-    dapo_val_dataset.to_parquet(dapo_val_output_path)
-    print(f"Saved DAPO validation data to {dapo_val_output_path}")
 
     # Process validation datasets
     print("\n" + "="*80)
@@ -305,8 +297,7 @@ if __name__ == "__main__":
     print("="*80)
     print(f"Training examples: {len(train_dataset)}")
     print(f"  - DAPO-Math-17k-dedup (train): {len(train_dataset)}")
-    print(f"\nValidation examples: {len(combined_val_dataset)} (+ {len(dapo_val_dataset)} DAPO val)")
-    print(f"  - DAPO val: {len(dapo_val_dataset)}")
+    print(f"\nValidation examples: {len(combined_val_dataset)}")
     print(f"  - AIME 2024: {len(aime24_dataset)}")
     print(f"  - AIME 2025: {len(aime25_dataset)}")
     print(f"  - MATH-500: {len(math500_dataset)}")

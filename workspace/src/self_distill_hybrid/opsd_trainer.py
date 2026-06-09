@@ -28,15 +28,17 @@ from torch.utils.data import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from verl.checkpoint_engine import CheckpointEngineManager
 from verl.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.metric_utils import process_validation_metrics
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 
-from .sd_verifier import build_opsd_batch, build_sft_batch, verify_batch
+from .sd_verifier import build_opsd_batch, verify_batch
 
 py_logger = logging.getLogger(__name__)
 
@@ -58,7 +60,6 @@ class OPSDTrainer:
         train_dataset: SD prompt dataset.
         collate_fn: Batch collation function.
         device_name: Device name for training.
-        val_data_path: Path to SD val parquet for _compute_val_loss().
         val_reward_fn: Reward manager for generation-based validation.
         val_dataset: RL-format dataset for generation-based validation.
     """
@@ -74,7 +75,6 @@ class OPSDTrainer:
         train_dataset: Optional[Dataset] = None,
         collate_fn=None,
         device_name=None,
-        val_data_path: Optional[str] = None,
         val_reward_fn=None,
         val_dataset: Optional[Dataset] = None,
     ):
@@ -93,6 +93,25 @@ class OPSDTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
+
+        # Actor-side DP world size = total GPUs / Ulysses-SP. Used as the
+        # divisor when padding batches before the nd-compute dispatcher slices
+        # along the actor mesh's DP axis.
+        #
+        # TP is rollout-only (sglang's tensor_model_parallel_size) — it does
+        # NOT collapse the actor's DP axis. The actor's FSDP+Ulysses mesh has
+        # dimensions (dp, ulysses_sp), so dp_world = total_gpus / ulysses_sp.
+        # Earlier we divided by TP*SP, which under-padded (or skipped padding
+        # entirely) when TP>1: e.g. TP=2 SP=4 8GPUs gave dp_world=1, but the
+        # dispatcher actually requested chunks=2 and the batch crashed with
+        # AssertionError("only support equal chunk").
+        total_gpus = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        sp = self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
+        self.dp_world = max(1, total_gpus // int(sp))
+        py_logger.info(
+            "DP world = %d (total_gpus=%d, ulysses_sp=%d)",
+            self.dp_world, total_gpus, sp,
+        )
 
         # OPSD-specific config
         self.opsd_config = self.config.get("opsd", {})
@@ -125,9 +144,6 @@ class OPSDTrainer:
 
         # Create dataloader
         self._create_dataloader(train_dataset, collate_fn)
-
-        # Build pre-tokenized validation batch from held-out teacher data
-        self._build_val_data(val_data_path)
 
         # Generation-based validation
         self.val_reward_fn = val_reward_fn
@@ -176,71 +192,6 @@ class OPSDTrainer:
         except Exception as e:
             py_logger.warning("Could not set total_training_steps in config: %s", e)
 
-    def _build_val_data(self, val_data_path: Optional[str]):
-        """Pre-tokenize held-out validation data for periodic val loss computation."""
-        import pandas as pd
-
-        self.val_batches = None
-
-        if not val_data_path or not os.path.exists(val_data_path):
-            py_logger.info("No val_data_path or file missing, val loss disabled")
-            return
-
-        val_df = pd.read_parquet(val_data_path)
-        val_max_samples = self.opsd_config.get("val_max_samples", -1)
-        if val_max_samples > 0 and len(val_df) > val_max_samples:
-            val_df = val_df.head(val_max_samples)
-        py_logger.info("Loading %d val samples from %s", len(val_df), val_data_path)
-
-        sft_prompts = val_df["sft_prompt"].tolist()
-        teacher_solutions = val_df["teacher_solution"].tolist()
-
-        full_val_batch = build_sft_batch(
-            sft_prompts=sft_prompts,
-            responses=teacher_solutions,
-            tokenizer=self.tokenizer,
-            max_length=self.sft_max_length,
-        )
-
-        if full_val_batch is None or len(full_val_batch.batch["input_ids"]) == 0:
-            py_logger.info("Val batch is empty after tokenization, val loss disabled")
-            return
-
-        n_val = full_val_batch.batch["input_ids"].shape[0]
-        n_dp = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-
-        if n_val % n_dp != 0:
-            pad_to = ((n_val // n_dp) + 1) * n_dp
-            pad_count = pad_to - n_val
-            padded_dict = {}
-            for key in ["input_ids", "attention_mask", "position_ids", "loss_mask"]:
-                tensor = full_val_batch.batch[key]
-                last = tensor[-1:].expand(pad_count, *tensor.shape[1:]).clone()
-                padded_dict[key] = torch.cat([tensor, last], dim=0)
-            full_val_batch = DataProto.from_single_dict(padded_dict)
-            n_val = full_val_batch.batch["input_ids"].shape[0]
-
-        dispatch_batch_size = self.config.data.train_batch_size
-        self.val_batches = []
-        for start in range(0, n_val, dispatch_batch_size):
-            end = min(start + dispatch_batch_size, n_val)
-            chunk_dict = {}
-            for key in ["input_ids", "attention_mask", "position_ids", "loss_mask"]:
-                chunk_dict[key] = full_val_batch.batch[key][start:end]
-            chunk_size = chunk_dict["input_ids"].shape[0]
-            if chunk_size % n_dp != 0:
-                chunk_pad_to = ((chunk_size // n_dp) + 1) * n_dp
-                chunk_pad_count = chunk_pad_to - chunk_size
-                for key in chunk_dict:
-                    last = chunk_dict[key][-1:].expand(chunk_pad_count, *chunk_dict[key].shape[1:]).clone()
-                    chunk_dict[key] = torch.cat([chunk_dict[key], last], dim=0)
-            self.val_batches.append(DataProto.from_single_dict(chunk_dict))
-
-        py_logger.info(
-            "Val data ready: %d samples, %d batch(es), test_freq=%d",
-            n_val, len(self.val_batches), self.test_freq,
-        )
-
     def _build_val_dataloader(self, val_dataset: Optional[Dataset]):
         self.val_dataloader = None
         if val_dataset is None or self.val_reward_fn is None:
@@ -265,32 +216,6 @@ class OPSDTrainer:
             "Generation-based val dataloader ready: %d samples, %d batch(es)",
             len(val_dataset), len(self.val_dataloader),
         )
-
-    def _compute_val_loss(self) -> Optional[float]:
-        if not self.val_batches:
-            return None
-
-        total_loss = 0.0
-        total_tokens = 0
-
-        for val_batch in self.val_batches:
-            output = self.actor_rollout_wg.compute_val_loss(val_batch)
-            raw_metrics = output.meta_info.get("metrics", {})
-
-            losses = raw_metrics.get("val_loss", [])
-            tokens = raw_metrics.get("val_tokens", [])
-            if not isinstance(losses, list):
-                losses = [losses]
-            if not isinstance(tokens, list):
-                tokens = [tokens]
-
-            for loss_i, tok_i in zip(losses, tokens):
-                total_loss += float(loss_i) * float(tok_i)
-                total_tokens += float(tok_i)
-
-        if total_tokens == 0:
-            return None
-        return total_loss / total_tokens
 
     def _dump_val_generations(
         self, inputs, outputs, scores, reward_extra_infos_dict,
@@ -400,6 +325,11 @@ class OPSDTrainer:
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(
                 test_gen_batch_padded
             )
+            # Do NOT sleep replicas here. Mirrors verl PPO's _validate, which
+            # only sleeps when a colocated reward model needs the GPU, and
+            # then immediately wakes it back up. Sleeping unconditionally
+            # would leave replicas asleep when _validate returns, causing the
+            # next training-iteration generate_sequences to hit dead workers.
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             output_ids = test_output_gen_batch.batch["responses"]
@@ -511,21 +441,25 @@ class OPSDTrainer:
     def init_workers(self):
         """Initialize distributed workers using Ray backend.
 
-        Creates the actor+rollout+ref worker group and the AgentLoopManager.
-        Requires ActorRolloutRef role for the frozen teacher (ref model).
+        Creates the actor+rollout+ref worker group, the AgentLoopManager, and
+        the CheckpointEngineManager that syncs trainer weights into the
+        sglang rollout replicas. Requires ActorRolloutRef role for the frozen
+        teacher (ref model).
         """
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {
             pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()
         }
 
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRolloutRef)
+        actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(
+            Role.ActorRolloutRef
+        )
         actor_rollout_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[Role.ActorRolloutRef],
             config=self.config.actor_rollout_ref,
             role=str(Role.ActorRolloutRef),
         )
-        self.resource_pool_to_cls[resource_pool][str(Role.ActorRolloutRef)] = actor_rollout_cls
+        self.resource_pool_to_cls[actor_rollout_resource_pool][str(Role.ActorRolloutRef)] = actor_rollout_cls
 
         all_wg = {}
         wg_kwargs = {"device_name": self.device_name}
@@ -552,11 +486,30 @@ class OPSDTrainer:
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
-        self.async_rollout_manager = AgentLoopManager(
+        # New verl 0.7.x AgentLoopManager exposes a `.create(...)` classmethod
+        # that drives the async _initialize_llm_servers + _init_agent_loop_workers
+        # init phases. The bare constructor leaves agent_loop_workers unset, which
+        # crashes generate_sequences() on the first val/train step.
+        self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
-            rm_resource_pool=None,
+            rollout_resource_pool=actor_rollout_resource_pool,
         )
+
+        # CheckpointEngineManager bridges the trainer FSDP model and the sglang
+        # rollout replicas. Without update_weights() after each actor step,
+        # generation would keep using the initial weights — breaking the
+        # on-policy assumption of OPSD.
+        checkpoint_engine_config = omega_conf_to_dataclass(
+            self.config.actor_rollout_ref.rollout.checkpoint_engine
+        )
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            trainer=self.actor_rollout_wg,
+            replicas=self.async_rollout_manager.rollout_replicas,
+        )
+        # Start with rollout asleep; fit() will wake + sync before first gen.
+        self.checkpoint_manager.sleep_replicas()
 
         py_logger.info("OPSD workers initialized successfully")
 
@@ -598,11 +551,10 @@ class OPSDTrainer:
     def _update_teacher_weights(self):
         """Hard-copy student weights to teacher (ref) model via workers.
 
-        Sends a dummy DataProto to trigger update_teacher on each worker.
+        Dispatched as Dispatch.ONE_TO_ALL on the worker side, so no input
+        payload is needed.
         """
-        n_dp = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-        dummy = DataProto.from_single_dict({"_dummy": torch.zeros(n_dp, 1)})
-        self.actor_rollout_wg.update_teacher(dummy)
+        self.actor_rollout_wg.update_teacher()
         py_logger.info(
             "Step %d: Teacher weights updated from student (teacher_update_freq=%d)",
             self.global_steps, self.teacher_update_freq,
@@ -632,6 +584,11 @@ class OPSDTrainer:
 
         self.global_steps = 0
         progress_bar = tqdm(total=self.total_training_steps, desc="OPSD Training")
+
+        # Wake rollout replicas and push initial trainer weights so the very
+        # first generation reflects the actual init checkpoint, not whatever
+        # sglang loaded internally.
+        self.checkpoint_manager.update_weights()
 
         self.global_steps += 1
 
@@ -683,6 +640,9 @@ class OPSDTrainer:
 
                 gen_t0 = time.time()
                 gen_output = self.async_rollout_manager.generate_sequences(batch)
+                # Release rollout GPU memory so the training forward/backward
+                # passes don't OOM. Matches the verl PPO loop.
+                self.checkpoint_manager.sleep_replicas()
                 gen_time = time.time() - gen_t0
 
                 gen_output.meta_info.pop("timing", None)
@@ -743,6 +703,12 @@ class OPSDTrainer:
                     metrics["timing/teacher_update_s"] = time.time() - teacher_t0
                     metrics["opsd/teacher_updated"] = 1.0
 
+                # Sync the freshly-updated student weights into the rollout
+                # replicas so the next training/val generation is on-policy.
+                weight_sync_t0 = time.time()
+                self.checkpoint_manager.update_weights()
+                metrics["timing/weight_sync_s"] = time.time() - weight_sync_t0
+
                 epoch_metrics["epoch/total_generated"] += batch_size
                 epoch_metrics["epoch/total_correct"] += n_correct
                 epoch_metrics["epoch/total_trained"] += batch_size  # ALL responses trained
@@ -755,14 +721,6 @@ class OPSDTrainer:
                 # ---- Phase 4: Validation ----
                 is_last_step = self.global_steps >= self.total_training_steps
                 is_val_step = self.test_freq > 0 and self.global_steps % self.test_freq == 0
-                if self.val_batches and (is_val_step or is_last_step):
-                    val_t0 = time.time()
-                    val_loss = self._compute_val_loss()
-                    val_time = time.time() - val_t0
-                    if val_loss is not None:
-                        metrics["val/loss"] = val_loss
-                        metrics["timing/val_s"] = val_time
-                        py_logger.info("Step %d: val/loss = %.4f (%.1fs)", self.global_steps, val_loss, val_time)
 
                 if self.val_reward_fn is not None and (is_val_step or is_last_step):
                     val_gen_t0 = time.time()
@@ -878,8 +836,10 @@ class OPSDTrainer:
 
         n_samples = opsd_batch.batch["student_input_ids"].shape[0]
 
-        # DP-pad: ensure batch is divisible by number of DP workers
-        n_dp = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        # DP-pad: ensure batch is divisible by DP world size (not total GPUs).
+        # The nd-compute dispatcher slices along the actor mesh's DP axis,
+        # so divisibility by dp_world is what's required.
+        n_dp = self.dp_world
         if n_samples % n_dp != 0:
             pad_to = ((n_samples // n_dp) + 1) * n_dp
             pad_count = pad_to - n_samples

@@ -1,14 +1,12 @@
 """
 Main entry point for OPSD (On-Policy Self-Distillation) training with VERL's HybridEngine.
 
-Uses Hydra for configuration management. Initializes Ray, creates workers,
-dataset, and launches the OPSDTrainer.
+Uses Hydra for configuration management. Initializes Ray, creates an
+``OPSDWorker`` group (hybrid actor+rollout+ref), builds the SD-prompt dataset
+and an optional generation-based val dataset, and launches ``OPSDTrainer``.
 
-Key differences from main_self_distill.py:
-  - Uses OPSDWorker instead of SelfDistillWorker
-  - Uses Role.ActorRolloutRef instead of Role.ActorRollout (ref model needed for teacher)
-  - Uses OPSDTrainer instead of SelfDistillTrainer
-  - Hydra config name: opsd_trainer instead of sd_trainer
+Role.ActorRolloutRef is used so the ref model is materialized as the frozen
+teacher for the JSD / reverse-KL loss.
 
 Usage:
     python -m self_distill_hybrid.main_opsd \\
@@ -149,30 +147,33 @@ class OPSDTaskRunner:
             max_samples=config.data.get("train_max_samples", -1),
         )
 
-        # 4. Resolve SD val parquet path (for _compute_val_loss)
-        sd_val_data_path = config.data.get("sd_val_files", None)
-        if not sd_val_data_path:
-            train_path = config.data.train_files
-            if isinstance(train_path, str):
-                val_candidate = train_path.replace(
-                    "self_distill_prompts.parquet", "self_distill_prompts_val.parquet"
-                )
-                if val_candidate != train_path and os.path.exists(val_candidate):
-                    sd_val_data_path = val_candidate
-                    logger.info("Auto-detected SD val data: %s", sd_val_data_path)
-
-        # 5. Load RL-format val dataset and reward manager for _validate()
+        # 4. Load RL-format val dataset and reward manager for _validate().
+        # NOTE: verl 0.7.x's load_reward_manager returns the EXPERIMENTAL
+        # NaiveRewardManager (verl.experimental.reward_loop.reward_manager),
+        # which only exposes `async run_single(data)` — it is NOT callable.
+        # OPSDTrainer._validate calls val_reward_fn(batch, return_dict=True),
+        # which requires the LEGACY NaiveRewardManager
+        # (verl.workers.reward_manager.naive). Construct it manually with the
+        # custom reward fn loaded from config.reward.custom_reward_function.
         val_reward_fn = None
         val_dataset = None
         rl_val_files = config.data.get("val_files", None)
         if rl_val_files:
-            from verl.trainer.ppo.reward import load_reward_manager
+            from verl.trainer.ppo.reward import get_custom_reward_fn
+            from verl.workers.reward_manager.naive import NaiveRewardManager
 
-            val_reward_fn = load_reward_manager(
-                config, tokenizer, num_examine=1,
-                **config.reward_model.get("reward_kwargs", {}),
+            compute_score = get_custom_reward_fn(config)
+            val_reward_fn = NaiveRewardManager(
+                tokenizer=tokenizer,
+                num_examine=0,
+                compute_score=compute_score,
+                reward_fn_key=config.data.get("reward_fn_key", "data_source"),
             )
-            logger.info("Loaded val_reward_fn for _validate() (data_source-based routing)")
+            logger.info(
+                "Loaded val_reward_fn for _validate() (data_source-based routing, "
+                "custom compute_score: %s)",
+                "yes" if compute_score is not None else "default",
+            )
 
             from verl.trainer.main_ppo import create_rl_dataset
 
@@ -183,10 +184,10 @@ class OPSDTaskRunner:
             )
             logger.info("Loaded RL val dataset: %d samples from %s", len(val_dataset), rl_val_files)
 
-        # 6. Initialize resource pools
+        # 5. Initialize resource pools
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        # 7. Create and run OPSD trainer
+        # 6. Create and run OPSD trainer
         from self_distill_hybrid.opsd_trainer import OPSDTrainer
 
         trainer = OPSDTrainer(
@@ -198,7 +199,6 @@ class OPSDTaskRunner:
             ray_worker_group_cls=ray_worker_group_cls,
             train_dataset=train_dataset,
             collate_fn=collate_fn,
-            val_data_path=sd_val_data_path,
             val_reward_fn=val_reward_fn,
             val_dataset=val_dataset,
         )

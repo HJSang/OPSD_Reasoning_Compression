@@ -29,9 +29,20 @@
 #   bash train_opsd.sh
 # =============================================================================
 
-set -x
+set -xeo pipefail
 
 ulimit -n 65535
+
+# NOTE: don't enable PYTORCH_CUDA_ALLOC_CONF=expandable_segments here.
+# sglang's torch_memory_saver explicitly refuses to initialise when the
+# expandable_segments allocator is selected:
+#   RuntimeError: TorchMemorySaver is disabled for the current process
+#   because expandable_segments is not supported yet.
+# which crashes model_runner.load_model during rollout init (observed
+# in tu50/tu100 first retries, Flyte f486fd4845df14f5b930 /
+# f782dcc0ede2e4c1babf). Until torch_memory_saver supports the new
+# allocator, address the reverse-KL / JSD OOMs by lowering JSD/KL
+# chunk_size in opsd_worker.py instead.
 
 # =============================================================================
 # Environment setup
@@ -39,11 +50,20 @@ ulimit -n 65535
 # Default paths — override via environment variables as needed
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
-VERL_ROOT="${VERL_ROOT:-$(cd "${WORKSPACE_ROOT}/../verl" && pwd)}"
 SD_SRC="${WORKSPACE_ROOT}/src"
 
-export PYTHONPATH="${VERL_ROOT}:${SD_SRC}:${PYTHONPATH}"
+# Use the image's installed verl as-is. Our dual-path math_verify scorer is a
+# standalone module loaded via custom_reward_function.path, not an in-tree verl
+# patch.
+export PYTHONPATH="${SD_SRC}:${PYTHONPATH}"
 echo "PYTHONPATH: $PYTHONPATH"
+
+# Auto-configure MLflow tracking when running on the Flyte/Kingkong cluster.
+# Sets MLFLOW_TRACKING_URI / MLFLOW_EXPERIMENT_NAME / MLFLOW_RUN_CONTEXT from
+# Flyte execution env vars so HuggingFace Trainer (and any other downstream
+# code that respects MLFLOW_*) logs to go/mlflowui automatically. Becomes a
+# no-op if FLYTE_INTERNAL_EXECUTION_PROJECT is unset (local invocations).
+source "${SCRIPT_DIR}/setup_mlflow_hf.sh"
 
 
 # =============================================================================
@@ -51,10 +71,9 @@ echo "PYTHONPATH: $PYTHONPATH"
 # =============================================================================
 MODEL_PATH=${MODEL_PATH:?MODEL_PATH environment variable is required}
 SD_PROMPTS_PATH=${SD_PROMPTS_PATH:?SD_PROMPTS_PATH environment variable is required}
-# Optional: SD val split for periodic val loss computation
-SD_VAL_PROMPTS_PATH=${SD_VAL_PROMPTS_PATH:-}
-# Optional: reward function file for generation-based validation (_validate)
-REWARD_FN_PATH=${REWARD_FN_PATH:-}
+# Optional: reward function file for generation-based validation (_validate).
+# Defaults to the standalone dual-path math_verify scorer.
+REWARD_FN_PATH=${REWARD_FN_PATH:-${SD_SRC}/rewards/dual_path_math_verify.py}
 # Optional: RL-format val dataset for generation-based validation
 RL_VAL_FILES=${RL_VAL_FILES:-}
 # Optional: prompt template key for process_eval_data.py (e.g. "length_prune_teacher")
@@ -93,7 +112,12 @@ VAL_MAX_TOKENS=${VAL_MAX_TOKENS:-${SD_MAX_TOKENS}}
 # Training hyperparameters
 # =============================================================================
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-10}
+# Hard step cap (overrides epoch-based length when set). null/empty = unlimited within epochs.
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-}
+# Optional: run generation-based val before the first training step. Set to
+# "false" for quick smoke tests so we skip the 30-min val_before_train round.
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-true}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
 LEARNING_RATE=${LEARNING_RATE:-1e-5}
@@ -155,7 +179,6 @@ echo "  SFT max len:     ${SFT_MAX_LENGTH}"
 echo "  Use liger:       ${USE_LIGER}"
 echo "  Check struct:    ${CHECK_STRUCTURE}"
 echo "  Teacher update:  every ${TEACHER_UPDATE_FREQ} steps (0=frozen)"
-echo "  Val prompts:     ${SD_VAL_PROMPTS_PATH:-<auto-detect>}"
 echo "  Reward fn:       ${REWARD_FN_PATH:-<none>}"
 echo "  RL val files:    ${RL_VAL_FILES:-<none>}"
 echo "  Prompt template: ${PROMPT_TEMPLATE:-<default: think_answer>}"
@@ -236,7 +259,6 @@ python3 -m self_distill_hybrid.main_opsd \
     actor_rollout_ref.rollout.val_kwargs.n=8 \
     \
     data.train_files="${SD_PROMPTS_PATH}" \
-    ${SD_VAL_PROMPTS_PATH:+data.sd_val_files="${SD_VAL_PROMPTS_PATH}"} \
     ${RL_VAL_FILES:+data.val_files="${RL_VAL_FILES}"} \
     data.train_batch_size="${TRAIN_BATCH_SIZE}" \
     data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
@@ -256,17 +278,19 @@ python3 -m self_distill_hybrid.main_opsd \
     opsd.teacher_update_freq="${TEACHER_UPDATE_FREQ}" \
     \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
+    ${TOTAL_TRAINING_STEPS:+trainer.total_training_steps="${TOTAL_TRAINING_STEPS}"} \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node="${N_GPUS}" \
     trainer.nnodes=1 \
     trainer.save_freq="${SAVE_FREQ}" \
     trainer.default_local_dir="${CHECKPOINT_DIR}" \
-    trainer.logger='["console"]' \
-    trainer.val_before_train=true \
+    trainer.logger='["console", "mlflow"]' \
+    trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
     opsd.detailed_log_dir="${DETAILED_LOG_DIR}" \
     ${TRAIN_MAX_SAMPLES:+data.train_max_samples=${TRAIN_MAX_SAMPLES}} \
-    ${REWARD_FN_PATH:+custom_reward_function.path="${REWARD_FN_PATH}"} \
+    ${REWARD_FN_PATH:+reward.custom_reward_function.path="${REWARD_FN_PATH}" \
+    reward.custom_reward_function.name=compute_score} \
     "$@"
 
 echo ""
