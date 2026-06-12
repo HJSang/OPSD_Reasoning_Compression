@@ -1,3 +1,4 @@
 [submodule "slime"]
 	path = slime
-	url = https://github.com/THUDM/slime.git
+	url = git@github.com:HJSang/slime.git
+	branch = crisp
