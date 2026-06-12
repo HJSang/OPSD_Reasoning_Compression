@@ -70,6 +70,9 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
+   # Pin Qwen3 thinking mode (mirrors verl opsd_trainer.yaml; guards against
+   # tokenizer default drift). Also forwarded to the teacher prompt in crisp_opd.
+   --apply-chat-template-kwargs '{"enable_thinking": true}'
    --rollout-shuffle
    --num-rollout 100                       # paper: step 100 is the sweet spot
    --rollout-batch-size 32
@@ -94,6 +97,9 @@ DISTILL_ARGS=(
    --opd-type sglang
    --opd-kl-coef 1.0
    --entropy-coef 0.00
+   # Global token-mean loss reduction: closest match to verl OPSD's
+   # kl_sum / n_tokens normalization (default slime reduction is per-rollout mean).
+   --calculate-per-token-loss
 )
 
 PERF_ARGS=(
@@ -112,9 +118,10 @@ OPTIMIZER_ARGS=(
    --optimizer adam
    --lr 1e-6
    --lr-decay-style constant
-   --weight-decay 0.1
+   # Match verl's AdamW defaults (train_opsd.sh leaves these unset).
+   --weight-decay 0.01
    --adam-beta1 0.9
-   --adam-beta2 0.98
+   --adam-beta2 0.999
 )
 
 SGLANG_ARGS=(

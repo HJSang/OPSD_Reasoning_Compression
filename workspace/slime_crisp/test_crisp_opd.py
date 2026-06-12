@@ -219,3 +219,38 @@ def test_refresh_gating(monkeypatch):
     crisp_opd.generate_rollout(args, 50, data_source=None, evaluation=True)
     crisp_opd.generate_rollout(make_args(crisp_teacher_update_interval=0), 50, data_source=None)
     assert calls == [50, 100]
+
+
+# ---------------------------------------------------------------------------
+# Parity with the verl pipeline (workspace/src, workspace/config)
+# ---------------------------------------------------------------------------
+
+
+def test_teacher_prompt_matches_prompts_json():
+    """The conciseness instruction must stay byte-identical to the verl pipeline's."""
+    import json
+    import pathlib
+
+    prompts_path = pathlib.Path(__file__).resolve().parents[1] / "config" / "prompts.json"
+    cfg = json.loads(prompts_path.read_text())["length_prune_teacher"]
+    assert crisp_opd.DEFAULT_TEACHER_PREFIX == cfg["prefix"]
+    assert crisp_opd.DEFAULT_TEACHER_SUFFIX == cfg["suffix"]
+
+
+def test_dapo_header_matches_verl_prep():
+    """Question extraction must strip the same DAPO header as the verl pipeline."""
+    import pathlib
+    import sys
+
+    verl_data_dir = str(pathlib.Path(__file__).resolve().parents[1] / "src" / "data")
+    sys.path.insert(0, verl_data_dir)
+    try:
+        import prepare_length_prune_data as verl_prep
+
+        import prepare_crisp_slime_data as slime_prep
+
+        dapo_prompt = [{"role": "user", "content": slime_prep.DAPO_PREFIX + "What is 2+2?"}]
+        assert verl_prep.extract_question_from_dapo(dapo_prompt) == "What is 2+2?"
+        assert slime_prep.extract_question(dapo_prompt[0]["content"]) == "What is 2+2?"
+    finally:
+        sys.path.remove(verl_data_dir)

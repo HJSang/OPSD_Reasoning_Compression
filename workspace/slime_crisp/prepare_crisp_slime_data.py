@@ -13,10 +13,14 @@ reward_func rebuilds the teacher prompt from ``metadata.question`` at rollout
 time. Extraction logic mirrors workspace/src/data/prepare_length_prune_data.py
 so the student/teacher prompt pair is identical to the verl pipeline.
 
+Split parity: same fixed-seed pandas shuffle + first-80% train split as
+workspace/src/data/prepare_length_prune_data.py::sample_and_split, so the
+training set is row-for-row identical to the verl pipeline's.
+
 Usage:
     python prepare_crisp_slime_data.py \
         --input-parquet ../data/DAPO-Math-17k-dedup/distinct-prompts-with-rewards.parquet \
-        --output ../data/crisp_slime/dapo_math_crisp.jsonl
+        --output ../data/crisp_slime/dapo_math_crisp_train.jsonl
 """
 
 import argparse
@@ -64,41 +68,57 @@ def extract_ground_truth(reward_model) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-parquet", required=True)
-    parser.add_argument("--output", required=True, help="Output jsonl path")
+    parser.add_argument("--output", required=True, help="Output train jsonl path")
+    parser.add_argument(
+        "--val-output", default=None, help="Optional val jsonl path (the held-out 1-train_frac)"
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
-        "--max-rows", type=int, default=None, help="Optional cap (e.g. small smoke-test files)"
+        "--train-frac",
+        type=float,
+        default=0.8,
+        help="Train fraction (default 0.8, matching the verl pipeline's split)",
+    )
+    parser.add_argument(
+        "--max-rows", type=int, default=None, help="Optional cap on TRAIN rows (smoke tests)"
     )
     args = parser.parse_args()
 
     df = pd.read_parquet(args.input_parquet)
     print(f"Loaded {len(df)} rows from {args.input_parquet}")
 
-    # Same fixed-seed shuffle as the verl pipeline for comparable data order.
+    # Same fixed-seed shuffle + first-80% split as the verl pipeline
+    # (prepare_length_prune_data.sample_and_split) -> identical train set.
     df = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+    n_train = int(len(df) * args.train_frac)
+    train_df, val_df = df.iloc[:n_train], df.iloc[n_train:]
     if args.max_rows:
-        df = df.iloc[: args.max_rows]
+        train_df = train_df.iloc[: args.max_rows]
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    n_written = n_skipped = 0
-    with open(args.output, "w", encoding="utf-8") as f:
-        for _, row in df.iterrows():
-            content = extract_user_content(row["prompt"])
-            question = extract_question(content)
-            gt = extract_ground_truth(row["reward_model"])
-            if not question or not gt:
-                n_skipped += 1
-                continue
-            f.write(
-                json.dumps(
-                    {"prompt": content, "label": gt, "metadata": {"question": question}},
-                    ensure_ascii=False,
+    def write_jsonl(split_df, path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        n_written = n_skipped = 0
+        with open(path, "w", encoding="utf-8") as f:
+            for _, row in split_df.iterrows():
+                content = extract_user_content(row["prompt"])
+                question = extract_question(content)
+                gt = extract_ground_truth(row["reward_model"])
+                if not question or not gt:
+                    n_skipped += 1
+                    continue
+                f.write(
+                    json.dumps(
+                        {"prompt": content, "label": gt, "metadata": {"question": question}},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-            n_written += 1
+                n_written += 1
+        print(f"Wrote {n_written} rows to {path} ({n_skipped} skipped: missing question/GT)")
 
-    print(f"Wrote {n_written} rows to {args.output} ({n_skipped} skipped: missing question/GT)")
+    write_jsonl(train_df, args.output)
+    if args.val_output:
+        write_jsonl(val_df, args.val_output)
 
 
 if __name__ == "__main__":

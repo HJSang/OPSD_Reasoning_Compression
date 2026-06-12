@@ -12,9 +12,16 @@ Design rationale: [`SLIME_DESIGN.md`](../../SLIME_DESIGN.md) §5; algorithm: [`M
 | KL estimator | full-vocabulary per-token `KL(q_t‖p_t)` from logits | **sampled-token** `log q(y_t) − log p(y_t)` as an advantage penalty (slime OPD) |
 | Teacher pass | training-side forward, swapped prompt | **prefill-only scoring call** to a teacher sglang server |
 | Teacher refresh | `update_teacher` FSDP shard copy | actor saves HF dump (`--save-hf`) → teacher server `/update_weights_from_disk` |
+| Response tokens in training | decoded text **re-tokenized** (+EOS appended) | **exact rollout token ids** (no re-tokenization; cleaner) |
+| In-training accuracy metric | dual-path `math_verify` (sympy) | `math_dapo` minerva (`Answer:` extraction) — what the paper's benchmarks used (footnote 1); curves may differ a few points from verl logs |
+| Teacher logit precision | trainer bf16 forward | sglang inference kernels (numerically close, not bit-equal) |
 
-Same prompts, same data, same hyperparameters. Whether the sampled estimator reproduces the
-paper's compression–accuracy trade-off is exactly what this milestone tests.
+Verified identical (audited, with regression tests): teacher prompt strings (byte-equal to
+`config/prompts.json`), question/GT extraction (0 mismatches on 2,000 real rows), train split
+(row-for-row equal to verl's seed-42 80% split, 13,918 rows), teacher-refresh window semantics
+(steps 1–50 use θ₀, 51–100 use θ₅₀ in both), sampling params, optimizer settings, no
+correctness filtering. Whether the sampled-token estimator reproduces the paper's
+compression–accuracy trade-off is exactly what this milestone tests.
 
 ## Files
 
