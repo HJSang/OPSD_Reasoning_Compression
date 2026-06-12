@@ -52,5 +52,7 @@ compression–accuracy trade-off is exactly what this milestone tests.
 ## Success criterion (vs paper Table 2, Qwen3-8B @30K budget)
 
 MATH-500: base 77.7% / 4,661 tok → CRISP 86.6% / 1,921 tok (58.8% reduction).
-If the sampled-KL estimator can't approach this, fall back to Option B in
-`SLIME_DESIGN.md` §5 (full-vocab KL as a custom loss type).
+If the sampled-KL estimator can't approach this, milestone 2 closes the gap with a
+distribution-level KL — see [`FULL_KL_PLAN.md`](FULL_KL_PLAN.md) (teacher top-K log-probs via
+sglang `top_logprobs_num` + bucketed reverse KL as a custom Megatron loss; recovers the verl
+objective exactly as K→V).
