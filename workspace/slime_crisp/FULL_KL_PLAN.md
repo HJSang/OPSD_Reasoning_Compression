@@ -5,8 +5,16 @@ Closes the one fundamental estimator gap between this port and the paper/verl im
 **distribution-level** reverse KL, computed from full student logits and (top-K-truncated)
 teacher log-probs — recovering verl's `_compute_reverse_kl_loss` objective as K→V.
 
-Status: **planned, not implemented**. Prerequisite: milestone-1 GPU baseline (sampled-KL A-run)
-so the A/B comparison in §6 has both arms.
+Status: **implemented** (loss: `crisp_full_kl_loss.py`; rollout top-K: `crisp_opd.py`;
+plumbing: slime submodule branch `crisp`, commit `e0ef620`; 23 unit tests passing).
+Not yet run on GPUs — the A/B in §6 needs both arms on the cluster.
+
+**Correction found during testing** (encoded in `test_full_kl_loss.py`): approximation
+fidelity is governed by **`q_tail`** (the *student's* mass outside teacher top-K), not by
+teacher coverage alone — reverse KL is an expectation under `q`, so a diffuse student hides
+large log-ratios in the tail bucket (the bucketed KL stays a lower bound). In CRISP's
+self-distillation regime q≈p so q_tail is tiny, and the tail term's gradient actively shrinks
+it; treat rising `q_tail` (logged per step) as the signal to raise K.
 
 ---
 
@@ -145,10 +153,10 @@ Degrade to plain torch when TP world size == 1 → CPU-unit-testable.
 
 ## 5. Observability
 
-Per-step logs (all cheap, from the loss metrics): `kl_full`, `kl_sampled` (same batch — directly
-measures estimator variance/bias), `teacher_topk_coverage`, `q_tail`, `student_entropy`
-(paper Fig. 8 parity), plus the existing `raw_reward` accuracy curve. If
-`teacher_topk_coverage` dips below ~0.995, raise K before trusting the run.
+Per-step logs (all cheap, from the loss metrics): `loss` (= bucketed KL), `kl_sampled` (same
+batch — directly measures estimator variance/bias), `teacher_topk_coverage`, `q_tail`, plus
+the existing `raw_reward` accuracy curve. **`q_tail` is the fidelity diagnostic** (see status
+note above); if it rises above ~1e-2, raise K before trusting the run.
 
 ---
 

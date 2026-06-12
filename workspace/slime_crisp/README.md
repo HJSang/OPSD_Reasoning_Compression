@@ -1,8 +1,16 @@
-# CRISP on slime (milestone 1)
+# CRISP on slime
 
 Runs CRISP — teacher = the **same model** conditioned on a conciseness prompt, reverse-KL
 distillation on the student's own rollouts, teacher refresh every M steps — on
-[slime](../../slime)'s sglang-mode on-policy distillation (`--use-opd --opd-type sglang`).
+[slime](../../slime). Two KL estimators, switched via `CRISP_KL_MODE`:
+
+- **`sampled`** (milestone 1): sampled-token reverse KL through slime's OPD advantage penalty
+  (`--use-opd --opd-type sglang`). Stock slime.
+- **`full`** (milestone 2, [`FULL_KL_PLAN.md`](FULL_KL_PLAN.md)): bucketed full-vocab reverse KL
+  over the teacher's top-K (`crisp_full_kl_loss.py`, wired as a Megatron `custom_loss`).
+  Equals the verl objective exactly at K=V (gradient-verified in tests). Requires the patched
+  slime submodule (branch `crisp`: plumbs `teacher_top_ids/logprobs`, ~30 lines).
+
 Design rationale: [`SLIME_DESIGN.md`](../../SLIME_DESIGN.md) §5; algorithm: [`METHOD.md`](../../METHOD.md).
 
 ## What differs from the verl implementation (`workspace/src/`)
@@ -34,12 +42,18 @@ compression–accuracy trade-off is exactly what this milestone tests.
     pure distillation; the signal is slime's `adv_t -= opd_kl_coef·(logπ_s(y_t) − logπ_t(y_t))`.
   - `generate_rollout` (`--rollout-function-path`): default rollout + teacher refresh
     (θ̃←θ) every `crisp_teacher_update_interval` rollouts via `/update_weights_from_disk`.
-- `crisp_config.yaml` — CRISP knobs, merged onto args via `--custom-config-path`.
+- `crisp_full_kl_loss.py` — milestone-2 loss: `vocab_parallel_topk_log_probs` (TP-aware,
+  autograd-correct), `bucketed_reverse_kl` (top-K + tail bucket), and the slime `custom_loss`
+  entry point `full_kl_loss_function` (logs `teacher_topk_coverage`, `q_tail`, and the
+  same-batch `kl_sampled` estimator-comparison diagnostic).
+- `crisp_config.yaml` / `crisp_config_full_kl.yaml` — per-mode knobs, merged onto args via
+  `--custom-config-path`.
 - `prepare_crisp_slime_data.py` — DAPO parquet → slime jsonl
   (`prompt` = original DAPO content, `label` = GT, `metadata.question` = bare question).
 - `run-qwen3-8b-crisp.sh` — 8-GPU launch: actor 4 | rollout 3 | teacher 1; paper recipe
   (batch 32, lr 1e-6, temp 1.0, 8192-token rollouts, n=1, 100 steps, M=50).
-- `test_crisp_opd.py` — unit tests (no GPU/slime runtime needed): `pytest test_crisp_opd.py`.
+  `CRISP_KL_MODE=full bash run-qwen3-8b-crisp.sh` for milestone 2.
+- `test_crisp_opd.py`, `test_full_kl_loss.py` — 23 unit tests (no GPU/slime runtime needed).
 
 ## Invariants to keep
 
@@ -48,11 +62,12 @@ compression–accuracy trade-off is exactly what this milestone tests.
 2. `--save-interval` == `crisp_teacher_update_interval`, `--save-hf` == `crisp_teacher_hf_path`
    (fixed path, overwritten each save).
 3. Synchronous `train.py` only — `train_async.py` would refresh the teacher mid-pipeline.
+4. Full-KL mode: CP must be 1 and `qkv_format` must be `thd` (asserted); the slime submodule
+   must be on the `crisp` branch (the plumbing patch).
 
 ## Success criterion (vs paper Table 2, Qwen3-8B @30K budget)
 
 MATH-500: base 77.7% / 4,661 tok → CRISP 86.6% / 1,921 tok (58.8% reduction).
-If the sampled-KL estimator can't approach this, milestone 2 closes the gap with a
-distribution-level KL — see [`FULL_KL_PLAN.md`](FULL_KL_PLAN.md) (teacher top-K log-probs via
-sglang `top_logprobs_num` + bucketed reverse KL as a custom Megatron loss; recovers the verl
-objective exactly as K→V).
+Run both estimators (`CRISP_KL_MODE=sampled` vs `full`) and compare against the verl
+reference; the `kl_sampled` diagnostic logged by the full-KL loss measures the estimator gap
+on identical batches. See [`FULL_KL_PLAN.md`](FULL_KL_PLAN.md) §6 for acceptance criteria.

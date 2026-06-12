@@ -41,6 +41,8 @@ class FakeSample:
     reward: float | None = None
     metadata: dict = field(default_factory=dict)
     teacher_log_probs: list | None = None
+    teacher_top_ids: list | None = None
+    teacher_top_logprobs: list | None = None
 
 
 def make_args(**overrides):
@@ -67,7 +69,15 @@ def fake_post_factory(captured, prompt_len, response_tokens, logprob_value=-0.5,
             entries.append([-1.0, tok])  # prompt span (discarded by trimming)
         for tok in ids:
             entries.append([logprob_value, tok])  # response span
-        return {"meta_info": {"input_token_logprobs": entries}}
+        meta_info = {"input_token_logprobs": entries}
+        if "top_logprobs_num" in payload:
+            k = payload["top_logprobs_num"]
+            # per position: K entries of [logprob, token_id]; None on position 0
+            meta_info["input_top_logprobs"] = [None] + [
+                [[-0.1 * (j + 1), 1000 + j] for j in range(k)]
+                for _ in range(len(payload["input_ids"]) - 1)
+            ]
+        return {"meta_info": meta_info}
 
     return fake_post
 
@@ -162,6 +172,42 @@ def test_reward_func_prompt_override(monkeypatch, fake_tokenizer):
     assert reward == 0.0  # label None -> metrics skipped
 
 
+def test_reward_func_full_kl_mode_fetches_topk(monkeypatch):
+    response_tokens = [11, 12, 13]
+    sample = FakeSample(
+        tokens=[1, 2] + response_tokens,
+        response_length=3,
+        metadata={"question": "q"},
+        label=None,
+    )
+    captured = {}
+    monkeypatch.setattr(crisp_opd, "_post", fake_post_factory(captured, prompt_len=2, response_tokens=response_tokens))
+    args = make_args(crisp_kl_mode="full", crisp_teacher_topk=4)
+
+    asyncio.run(crisp_opd.reward_func(args, sample))
+
+    assert captured["payload"]["top_logprobs_num"] == 4
+    # top-K trimmed to exactly the response span, [R, K]
+    assert len(sample.teacher_top_ids) == 3
+    assert len(sample.teacher_top_ids[0]) == 4
+    assert sample.teacher_top_ids[0] == [1000, 1001, 1002, 1003]
+    assert sample.teacher_top_logprobs[0] == [-0.1, -0.2, -0.30000000000000004, -0.4]
+    # sampled log-probs still collected alongside (for the kl_sampled diagnostic)
+    assert sample.teacher_log_probs == [-0.5, -0.5, -0.5]
+
+
+def test_reward_func_sampled_mode_skips_topk(monkeypatch):
+    response_tokens = [11]
+    sample = FakeSample(tokens=[1, 2] + response_tokens, response_length=1, metadata={"question": "q"})
+    captured = {}
+    monkeypatch.setattr(crisp_opd, "_post", fake_post_factory(captured, prompt_len=2, response_tokens=response_tokens))
+
+    asyncio.run(crisp_opd.reward_func(make_args(), sample))
+
+    assert "top_logprobs_num" not in captured["payload"]
+    assert sample.teacher_top_ids is None
+
+
 # ---------------------------------------------------------------------------
 # post_process_rewards
 # ---------------------------------------------------------------------------
@@ -182,6 +228,14 @@ def test_post_process_detects_missing_teacher_logprobs():
     samples = [FakeSample(reward=1.0, response_length=3, teacher_log_probs=None)]
     with pytest.raises(AssertionError, match="teacher_log_probs"):
         crisp_opd.post_process_rewards(make_args(), samples)
+
+
+def test_post_process_full_mode_requires_topk():
+    samples = [
+        FakeSample(reward=1.0, response_length=3, teacher_log_probs=[-0.1] * 3, teacher_top_ids=None)
+    ]
+    with pytest.raises(AssertionError, match="teacher_top_ids"):
+        crisp_opd.post_process_rewards(make_args(crisp_kl_mode="full"), samples)
 
 
 # ---------------------------------------------------------------------------

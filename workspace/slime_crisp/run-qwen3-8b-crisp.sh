@@ -13,6 +13,13 @@
 # GPU layout (8 GPUs): actor 4 | rollout 3 | teacher 1 (GPU 7).
 # Uses synchronous train.py — REQUIRED for correct teacher-refresh ordering.
 #
+# KL estimator (CRISP_KL_MODE):
+#   sampled (default) — milestone 1: sampled-token reverse KL via slime's OPD
+#                       advantage penalty (--use-opd).
+#   full              — milestone 2 (FULL_KL_PLAN.md): bucketed full-vocab
+#                       reverse KL over teacher top-K as a custom Megatron
+#                       loss. Requires the patched slime (crisp branch).
+#
 # Prereqs:
 #   1. HF checkpoint at $HF_CKPT, converted Megatron ckpt at $MCORE_CKPT
 #      (tools/convert_hf_to_torch_dist.py, see slime OPD example README)
@@ -83,23 +90,44 @@ ROLLOUT_ARGS=(
    --global-batch-size 32                  # 1 optimizer step per rollout
 )
 
+CRISP_KL_MODE=${CRISP_KL_MODE:-sampled}
+
+if [ "${CRISP_KL_MODE}" = "full" ]; then
+    CRISP_CONFIG=${CRISP_DIR}/crisp_config_full_kl.yaml
+    DISTILL_ARGS=(
+       # Distribution-level loss replaces the PG/OPD pipeline entirely.
+       --loss-type custom_loss
+       --custom-loss-function-path slime_crisp.crisp_full_kl_loss.full_kl_loss_function
+       # Skip advantages AND the old-log-prob forward pass — the custom loss
+       # needs only the training forward.
+       --disable-compute-advantages-and-returns
+       # Recompute the loss fn in backward: frees the per-chunk softmax graph,
+       # bounding loss memory to the [T, V] logits already resident.
+       --recompute-loss-function
+       --advantage-estimator grpo           # unused (advantages disabled); schema only
+       --entropy-coef 0.00
+       --calculate-per-token-loss           # global token mean == verl normalization
+    )
+else
+    CRISP_CONFIG=${CRISP_DIR}/crisp_config.yaml
+    DISTILL_ARGS=(
+       --advantage-estimator grpo           # degenerate at n=1 + reward 0: pure OPD penalty
+       --use-opd
+       --opd-type sglang
+       --opd-kl-coef 1.0
+       --entropy-coef 0.00
+       # Global token-mean loss reduction: closest match to verl OPSD's
+       # kl_sum / n_tokens normalization (default slime reduction is per-rollout mean).
+       --calculate-per-token-loss
+    )
+fi
+
 CRISP_ARGS=(
    --custom-rm-path slime_crisp.crisp_opd.reward_func
    --custom-reward-post-process-path slime_crisp.crisp_opd.post_process_rewards
    --rollout-function-path slime_crisp.crisp_opd.generate_rollout
    --rm-url http://${TEACHER_IP}:${TEACHER_PORT}/generate
-   --custom-config-path ${CRISP_DIR}/crisp_config.yaml
-)
-
-DISTILL_ARGS=(
-   --advantage-estimator grpo              # degenerate at n=1 + reward 0: pure OPD penalty
-   --use-opd
-   --opd-type sglang
-   --opd-kl-coef 1.0
-   --entropy-coef 0.00
-   # Global token-mean loss reduction: closest match to verl OPSD's
-   # kl_sum / n_tokens normalization (default slime reduction is per-rollout mean).
-   --calculate-per-token-loss
+   --custom-config-path ${CRISP_CONFIG}
 )
 
 PERF_ARGS=(

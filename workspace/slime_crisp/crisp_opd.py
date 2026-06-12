@@ -34,6 +34,8 @@ CRISP-specific knobs (set via ``--custom-config-path`` YAML; all land on args):
   crisp_teacher_hf_path: /path/to/hf_dump      # must equal --save-hf
   crisp_teacher_url: http://ip:port/generate   # optional; defaults to --rm-url
   crisp_teacher_prompt_prefix / _suffix        # optional template overrides
+  crisp_kl_mode: sampled | full                # full also fetches teacher top-K
+  crisp_teacher_topk: 256                      # K for crisp_kl_mode: full
 
 Alignment invariant (see METHOD.md): teacher and student share the exact same
 response token ids after different prompts, so per-position log-probs align by
@@ -106,6 +108,9 @@ async def reward_func(args, sample, **kwargs):
     """
     if sample.response_length == 0:
         sample.teacher_log_probs = []
+        if getattr(args, "crisp_kl_mode", "sampled") == "full":
+            sample.teacher_top_ids = []
+            sample.teacher_top_logprobs = []
         return 0.0
 
     question = (sample.metadata or {}).get("question")
@@ -123,19 +128,23 @@ async def reward_func(args, sample, **kwargs):
     # Prefill-only scoring pass: teacher prompt + the student's exact response
     # token ids. logprob_start_len=0 mirrors slime's OPD example; we trim to
     # the response span below.
-    output = await _post(
-        url,
-        {
-            "input_ids": teacher_prompt_ids + response_tokens,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": 0,
-                "skip_special_tokens": False,
-            },
-            "return_logprob": True,
-            "logprob_start_len": 0,
+    payload = {
+        "input_ids": teacher_prompt_ids + response_tokens,
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": 0,
+            "skip_special_tokens": False,
         },
-    )
+        "return_logprob": True,
+        "logprob_start_len": 0,
+    }
+    # Full-KL mode (milestone 2): also fetch the teacher's top-K distribution
+    # per position, consumed by crisp_full_kl_loss.full_kl_loss_function.
+    full_kl = getattr(args, "crisp_kl_mode", "sampled") == "full"
+    if full_kl:
+        payload["top_logprobs_num"] = int(getattr(args, "crisp_teacher_topk", 256))
+
+    output = await _post(url, payload)
 
     # input_token_logprobs entries are [logprob, token_id, ...]; the first
     # entry of the sequence has logprob None, but it can never fall inside the
@@ -156,6 +165,19 @@ async def reward_func(args, sample, **kwargs):
     )
     sample.teacher_log_probs = teacher_log_probs
 
+    if full_kl:
+        # input_top_logprobs: per input position, a list of [logprob, token_id, ...]
+        # entries (length top_logprobs_num). Trim to the response span like
+        # input_token_logprobs.
+        top_entries = output["meta_info"]["input_top_logprobs"][-sample.response_length :]
+        k = payload["top_logprobs_num"]
+        assert all(pos is not None and len(pos) == k for pos in top_entries), (
+            "input_top_logprobs malformed inside the response span (None or wrong K); "
+            "check the deployed sglang version's top_logprobs_num support."
+        )
+        sample.teacher_top_logprobs = [[e[0] for e in pos] for pos in top_entries]
+        sample.teacher_top_ids = [[e[1] for e in pos] for pos in top_entries]
+
     if sample.label is None:
         return 0.0
     return _compute_correct(sample.response, sample.label)
@@ -175,6 +197,14 @@ def post_process_rewards(args, samples, **kwargs):
         f"{len(missing)} samples are missing teacher_log_probs (indices {missing[:5]}...). "
         "Was reward_func wired via --custom-rm-path?"
     )
+    if getattr(args, "crisp_kl_mode", "sampled") == "full":
+        missing_topk = [
+            i for i, s in enumerate(samples) if s.teacher_top_ids is None and s.response_length > 0
+        ]
+        assert not missing_topk, (
+            f"crisp_kl_mode=full but {len(missing_topk)} samples are missing teacher_top_ids "
+            f"(indices {missing_topk[:5]}...). reward_func must run with the same custom config."
+        )
     raw_rewards = [float(s.reward) if s.reward is not None else 0.0 for s in samples]
     return raw_rewards, [0.0] * len(samples)
 

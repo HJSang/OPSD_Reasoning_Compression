@@ -1,5 +1,9 @@
 # CRISP-specific knobs, merged onto slime args via --custom-config-path.
 # (slime's parser setattr's every key here onto the args Namespace.)
+# This is the milestone-1 (sampled-token KL) config; the full-vocab KL
+# variant lives in crisp_config_full_kl.yaml.
+
+crisp_kl_mode: sampled
 
 # Teacher refresh interval M (paper default: 50; 0 = frozen teacher).
 # MUST equal --save-interval in the launch script, and requires synchronous
