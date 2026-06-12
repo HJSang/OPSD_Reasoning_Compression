@@ -1,0 +1,3 @@
+[submodule "slime"]
+	path = slime
+	url = https://github.com/THUDM/slime.git
