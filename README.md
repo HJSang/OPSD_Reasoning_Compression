@@ -45,6 +45,34 @@ All numbers are mean@8 under a 30K-token budget, scored with a dual-path grader 
 - **Instruction-agnostic.** The effect does not depend on a single hand-tuned prompt: v1 trades more compression for a small accuracy cost, v2 protects hard problems; both compress strongly while preserving accuracy.
 - **General capabilities and entropy preserved.** Out-of-domain accuracy on GPQA-Diamond and MMLU stays within ~1 point of the base model, and the student's policy entropy is stable throughout training (no entropy collapse).
 
+## Model Checkpoints
+
+All trained CRISP checkpoints are on the Hugging Face Hub: [huggingface.co/pb09204048](https://huggingface.co/pb09204048/models). Each model is released in two variants — **v1** (uniform concise prompt, more aggressive compression) and **v2** (difficulty-aware prompt, better accuracy on hard problems). The `pb09204048/CRISP` repo holds the DAPO-Math training prompts (v1/v2 conciseness columns).
+
+| Base model | v1 (uniform) | v2 (difficulty-aware) |
+|------------|--------------|-----------------------|
+| Qwen3-8B  | [CRISP-Qwen3-8B-v1](https://huggingface.co/pb09204048/CRISP-Qwen3-8B-v1) | [CRISP-Qwen3-8B-v2](https://huggingface.co/pb09204048/CRISP-Qwen3-8B-v2) |
+| Qwen3-14B | [CRISP-Qwen3-14B-v1](https://huggingface.co/pb09204048/CRISP-Qwen3-14B-v1) | [CRISP-Qwen3-14B-v2](https://huggingface.co/pb09204048/CRISP-Qwen3-14B-v2) |
+| DeepSeek-R1-Distill-Llama-8B | [CRISP-DeepSeek-R1-Distill-Llama-8B-v1](https://huggingface.co/pb09204048/CRISP-DeepSeek-R1-Distill-Llama-8B-v1) | [CRISP-DeepSeek-R1-Distill-Llama-8B-v2](https://huggingface.co/pb09204048/CRISP-DeepSeek-R1-Distill-Llama-8B-v2) |
+
+Load any checkpoint directly with `transformers` and generate as usual (the models emit an `Answer:` line and, on Qwen3, a `<think>...</think>` trace):
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "pb09204048/CRISP-Qwen3-8B-v2"
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+
+prompt = "Find all real numbers x such that x^3 - 6x^2 + 11x - 6 = 0.\n\nRemember to put your answer on its own line after \"Answer:\"."
+messages = [{"role": "user", "content": prompt}]
+inputs = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
+out = model.generate(inputs, max_new_tokens=30000, temperature=0.6, top_p=0.95, top_k=20)
+print(tok.decode(out[0][inputs.shape[1]:], skip_special_tokens=True))
+```
+
+To reproduce the paper numbers, evaluate each checkpoint against its base model on MATH-500 / AIME with the dual-path grader (`Answer:` line **or** `\boxed{}`), mean@8, 30K-token budget — comparing the CRISP checkpoint's accuracy and average response length to the base model quantifies the accuracy change and token reduction reported above.
+
 ## Repository Structure
 
 ```
