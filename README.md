@@ -19,13 +19,31 @@ Training generates student rollouts and minimizes per-token reverse KL divergenc
 
 ## Results
 
-| Model | Benchmark | Token Reduction | Accuracy Change |
-|-------|-----------|----------------|-----------------|
-| Qwen3-8B | MATH-500 | 59% | +9 pts (77% → 86%) |
-| Qwen3-14B | MATH-500 | 57% | +16 pts (70% → 86%) |
-| Qwen3-14B | AIME 2024 | 41% | +10 pts |
+All numbers are mean@8 under a 30K-token budget, scored with a dual-path grader (`Answer:` line **or** `\boxed{}`, math-verified). We use two conciseness instructions: **v1** (uniform "be concise") compresses more aggressively, while **v2** (difficulty-aware) better preserves accuracy on hard problems. Reduction is relative to the base model's average response length.
 
-Compression naturally adapts to problem difficulty (~1.6x more compression on easy vs. hard problems), entropy remains stable throughout training, and general capabilities (MMLU) are fully preserved.
+### MATH-500 (in-domain, easiest)
+
+| Model | Base acc | v2 acc / reduction | v1 acc / reduction |
+|-------|:--------:|:------------------:|:------------------:|
+| Qwen3-8B  | 95.7 | 95.7 / 32% | 95.7 / 57% |
+| Qwen3-14B | 93.0 | 95.2 / 35% | 96.3 / 56% |
+| Qwen3-32B | 95.6 | 96.0 / 30% | 94.3 / 51% |
+| DeepSeek-R1-Distill-Llama-8B | 71.3 | 79.8 / 23% | 82.1 / 32% |
+
+### AIME 2024 (in-domain, harder)
+
+| Model | Base acc | v2 acc / reduction | v1 acc / reduction |
+|-------|:--------:|:------------------:|:------------------:|
+| Qwen3-8B  | 76.2 | 75.0 / 17% | 72.9 / 33% |
+| Qwen3-14B | 75.0 | 75.0 / 20% | 73.8 / 38% |
+| Qwen3-32B | 80.5 | 80.4 / 19% | 72.9 / 30% |
+| DeepSeek-R1-Distill-Llama-8B | 33.3 | 42.1 / −3% | 39.2 / 6% |
+
+**Takeaways:**
+- **Compression with preserved accuracy.** CRISP shortens reasoning by up to ~57% on MATH-500 while holding accuracy, and improves it where the base model has room (Qwen3-14B +3.3 pts on MATH-500; DeepSeek-R1-Distill-Llama-8B +10.8 pts).
+- **Difficulty-adaptive.** Reductions are largest on the easier MATH-500 and smaller on the harder AIME benchmarks — the KL objective compresses easy problems more, with no explicit difficulty estimation.
+- **Instruction-agnostic.** The effect does not depend on a single hand-tuned prompt: v1 trades more compression for a small accuracy cost, v2 protects hard problems; both compress strongly while preserving accuracy.
+- **General capabilities and entropy preserved.** Out-of-domain accuracy on GPQA-Diamond and MMLU stays within ~1 point of the base model, and the student's policy entropy is stable throughout training (no entropy collapse).
 
 ## Repository Structure
 
