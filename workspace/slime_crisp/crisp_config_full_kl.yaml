@@ -1,0 +1,23 @@
+# CRISP full-KL mode (milestone 2, FULL_KL_PLAN.md) — merged onto slime args
+# via --custom-config-path. Same knobs as crisp_config.yaml plus the KL mode.
+# Pair with the full-KL CLI flags set by run-qwen3-8b-crisp.sh under
+# CRISP_KL_MODE=full (--loss-type custom_loss etc.).
+
+crisp_kl_mode: full
+crisp_teacher_topk: 256          # bucketed-KL K; coverage logged per step
+crisp_kl_chunk_size: 128         # token chunk for the loss (memory bound)
+
+# Teacher refresh interval M (paper default: 50; 0 = frozen teacher).
+# MUST equal --save-interval; synchronous train.py only.
+crisp_teacher_update_interval: 50
+
+# Where the actor dumps HF weights for the teacher to reload.
+# MUST equal --save-hf. Fixed path so each save overwrites the previous dump.
+crisp_teacher_hf_path: /root/crisp_teacher_hf
+
+# Optional: teacher /generate URL; defaults to --rm-url when unset.
+# crisp_teacher_url: http://127.0.0.1:13141/generate
+
+# Optional teacher-prompt overrides (defaults = paper Figure-3 instruction).
+# crisp_teacher_prompt_prefix: "..."
+# crisp_teacher_prompt_suffix: "..."

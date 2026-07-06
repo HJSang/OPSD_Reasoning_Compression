@@ -1,0 +1,4 @@
+[submodule "slime"]
+	path = slime
+	url = git@github.com:HJSang/slime.git
+	branch = crisp
